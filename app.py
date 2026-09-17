@@ -1,4 +1,4 @@
-"""
+﻿"""
 택시 사업 자동화 — Streamlit 멀티탭 UI
 스펙: exe 배포 / Gemini AI / OCR / 미리보기·백업 / 매핑
 """
@@ -146,20 +146,20 @@ def _render_doc_draft_editor() -> None:
 
 
 def _render_master_lists() -> None:
+    master_data.migrate_master_schema()
     vehicles = master_data.load_vehicles()
     drivers = master_data.load_drivers()
-    with st.expander("등록된 차량·기사 목록", expanded=True):
+    with st.expander("등록된 차량·기사 목록", expanded=False):
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("**차량**")
+            st.markdown("**차량** (상태 메모)")
             if vehicles:
                 st.dataframe(
                     [
                         {
                             "차량번호": v.get("plate", ""),
                             "차종": v.get("vehicle_type", ""),
-                            "담당기사": v.get("driver_name", ""),
-                            "메모": v.get("note", ""),
+                            "상태메모": v.get("note", ""),
                         }
                         for v in vehicles
                     ],
@@ -169,14 +169,16 @@ def _render_master_lists() -> None:
             else:
                 st.caption("등록된 차량 없음")
         with c2:
-            st.markdown("**기사**")
+            st.markdown("**기사** (배정·변동·특이)")
             if drivers:
                 st.dataframe(
                     [
                         {
                             "이름": d.get("name", ""),
                             "전화": d.get("phone", ""),
-                            "메모": d.get("note", ""),
+                            "배정차량": d.get("assigned_plate", ""),
+                            "변동사항": d.get("changes", ""),
+                            "특이사항": d.get("note", ""),
                         }
                         for d in drivers
                     ],
@@ -185,6 +187,37 @@ def _render_master_lists() -> None:
                 )
             else:
                 st.caption("등록된 기사 없음")
+
+
+def _scroll_chat_to_bottom() -> None:
+    """고정 높이 채팅 컨테이너를 맨 아래(최신)로 스크롤."""
+    import streamlit.components.v1 as components
+
+    components.html(
+        """
+        <script>
+        (function () {
+          const doc = window.parent.document;
+          const end = doc.getElementById("hana-chat-end");
+          if (!end) return;
+          let el = end.parentElement;
+          while (el && el !== doc.body) {
+            const oy = window.parent.getComputedStyle(el).overflowY;
+            if (
+              el.scrollHeight > el.clientHeight + 40 &&
+              (oy === "auto" || oy === "scroll" || el.getAttribute("data-testid") === "stVerticalBlockBorderWrapper")
+            ) {
+              el.scrollTop = el.scrollHeight;
+              break;
+            }
+            el = el.parentElement;
+          }
+          try { end.scrollIntoView({ block: "end", behavior: "instant" }); } catch (e) {}
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
 
 def _render_dispatch_preview() -> None:
@@ -261,12 +294,34 @@ def _render_master_preview() -> None:
             st.rerun()
 
 
+def _render_pending_action_block() -> bool:
+    """
+    해당 채팅(최신 변경)에 붙는 적용 UI.
+    마스터 / 배차 / 공문 초안 중 하나라도 있으면 True.
+    """
+    has_master = bool(st.session_state.get("master_pending_ops"))
+    has_dispatch = bool(st.session_state.get("dispatch_pending_ops"))
+    has_doc = bool(st.session_state.get("doc_draft_active"))
+    if not (has_master or has_dispatch or has_doc):
+        return False
+    with st.chat_message("assistant"):
+        st.markdown("**⬇️ 이 답변에 대한 적용**")
+        if has_master:
+            _render_master_preview()
+        if has_dispatch:
+            _render_dispatch_preview()
+        if has_doc:
+            _render_doc_draft_editor()
+    return True
+
+
 def tab_chat(model: str) -> None:
     """기사·차량 마스터 + 배차일지 + 공문 초안 + 일반 채팅."""
     st.subheader("AI 채팅")
     st.caption(
         "차량·기사 등록, 배차일지 기입, 공문 초안을 지원합니다. "
-        "변경은 미리보기/편집 후 적용해야 저장됩니다."
+        "채팅창에서 위로 스크롤하면 이전 대화를 볼 수 있고, "
+        "변경 **적용**은 해당 답변 바로 아래에 붙습니다."
     )
 
     if not has_api_key():
@@ -275,8 +330,6 @@ def tab_chat(model: str) -> None:
         return
 
     _render_master_lists()
-    _render_master_preview()
-    _render_doc_draft_editor()
 
     c1, c2 = st.columns([1, 5])
     with c1:
@@ -289,12 +342,23 @@ def tab_chat(model: str) -> None:
             _clear_doc_draft()
             st.rerun()
 
-    for msg in st.session_state.get("chat_messages", []):
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    # 고정 높이 채팅 컨테이너: 최신이 아래, 올리면 기록
+    with st.container(height=520, border=True):
+        messages = st.session_state.get("chat_messages", [])
+        if not messages and not (
+            st.session_state.get("master_pending_ops")
+            or st.session_state.get("dispatch_pending_ops")
+            or st.session_state.get("doc_draft_active")
+        ):
+            st.caption("메시지를 입력해 대화를 시작하세요.")
+        for msg in messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+        # 적용 버튼을 해당(최신) 변경 답변에 붙여 표시
+        _render_pending_action_block()
+        st.markdown('<div id="hana-chat-end"></div>', unsafe_allow_html=True)
 
-    # 배차/마스터 적용 버튼은 대화 바로 아래에 표시 (안 보이는 문제 방지)
-    _render_dispatch_preview()
+    _scroll_chat_to_bottom()
 
     prompt = st.chat_input(
         "예: 9월 배차일지 만들고 9801에 하종진 / 차량 9801 차종 D-M 등록"
@@ -302,84 +366,75 @@ def tab_chat(model: str) -> None:
     if not prompt:
         return
 
+    # 상태는 컨테이너 안에서만 그리므로, 여기서는 해석 후 저장하고 rerun
     st.session_state["chat_messages"].append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    with st.spinner("해석 중..."):
+        try:
+            interpreted = master_data.interpret_user_message(prompt, model=model)
+        except Exception as e:
+            interpreted = {
+                "mode": "chat",
+                "reply": f"오류: {e}",
+                "ops": [],
+                "doc": None,
+                "dispatch_ops": [],
+            }
 
-    with st.chat_message("assistant"):
-        with st.spinner("해석 중..."):
+        mode = interpreted.get("mode")
+        if mode == "master_ops" and interpreted.get("ops"):
+            st.session_state["master_pending_ops"] = interpreted["ops"]
+            st.session_state["master_pending_reply"] = interpreted.get("reply", "")
+            reply = (
+                (interpreted.get("reply") or "마스터 변경 미리보기입니다.")
+                + "\n\n이 답변 **바로 아래**에서 적용 또는 취소를 눌러 주세요."
+            )
+            st.session_state["chat_messages"].append(
+                {"role": "assistant", "content": reply}
+            )
+        elif mode == "dispatch_ops" and interpreted.get("dispatch_ops") is not None:
+            st.session_state["dispatch_pending_ops"] = interpreted["dispatch_ops"]
+            st.session_state["dispatch_pending_reply"] = interpreted.get("reply", "")
+            st.session_state["dispatch_pending_year"] = interpreted.get("year")
+            st.session_state["dispatch_pending_month"] = interpreted.get("month")
+            reply = (
+                (interpreted.get("reply") or "배차일지 변경 미리보기입니다.")
+                + "\n\n이 답변 **바로 아래**에서 **배차일지 적용** 또는 취소를 눌러 주세요."
+            )
+            st.session_state["chat_messages"].append(
+                {"role": "assistant", "content": reply}
+            )
+        elif mode == "doc_draft" and interpreted.get("doc"):
+            doc = interpreted["doc"]
+            reply = (
+                (interpreted.get("reply") or "공문 초안입니다.")
+                + "\n\n이 답변 **바로 아래**에서 제목·본문을 수정한 뒤 「공문으로 저장」을 눌러 주세요."
+            )
+            st.session_state["chat_messages"].append(
+                {"role": "assistant", "content": reply}
+            )
+            _seed_doc_draft(
+                doc.get("title") or "AI작성_공문",
+                doc.get("body") or "",
+                reply=interpreted.get("reply", ""),
+            )
+        else:
             try:
-                interpreted = master_data.interpret_user_message(prompt, model=model)
+                ctx = master_data.master_summary_text()
+                aug = list(st.session_state["chat_messages"][:-1]) + [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"[현재 마스터]\n{ctx}\n\n[사용자]\n{prompt}"
+                        ),
+                    }
+                ]
+                reply = chat_llm(aug, model=model)
             except Exception as e:
-                interpreted = {
-                    "mode": "chat",
-                    "reply": f"오류: {e}",
-                    "ops": [],
-                    "doc": None,
-                    "dispatch_ops": [],
-                }
-
-            mode = interpreted.get("mode")
-            if mode == "master_ops" and interpreted.get("ops"):
-                st.session_state["master_pending_ops"] = interpreted["ops"]
-                st.session_state["master_pending_reply"] = interpreted.get("reply", "")
-                reply = (
-                    (interpreted.get("reply") or "마스터 변경 미리보기입니다.")
-                    + "\n\n아래 **미리보기**에서 적용 또는 취소를 눌러 주세요."
-                )
-                st.markdown(reply)
-                st.session_state["chat_messages"].append(
-                    {"role": "assistant", "content": reply}
-                )
-                st.rerun()
-            elif mode == "dispatch_ops" and interpreted.get("dispatch_ops") is not None:
-                st.session_state["dispatch_pending_ops"] = interpreted["dispatch_ops"]
-                st.session_state["dispatch_pending_reply"] = interpreted.get("reply", "")
-                st.session_state["dispatch_pending_year"] = interpreted.get("year")
-                st.session_state["dispatch_pending_month"] = interpreted.get("month")
-                reply = (
-                    (interpreted.get("reply") or "배차일지 변경 미리보기입니다.")
-                    + "\n\n대화 **바로 아래**의 미리보기에서 **배차일지 적용** 또는 취소를 눌러 주세요."
-                )
-                st.markdown(reply)
-                st.session_state["chat_messages"].append(
-                    {"role": "assistant", "content": reply}
-                )
-                st.rerun()
-            elif mode == "doc_draft" and interpreted.get("doc"):
-                doc = interpreted["doc"]
-                reply = (
-                    (interpreted.get("reply") or "공문 초안입니다.")
-                    + "\n\n아래 **제목·본문을 수정**한 뒤 「공문으로 저장」을 눌러 주세요."
-                )
-                st.markdown(reply)
-                st.session_state["chat_messages"].append(
-                    {"role": "assistant", "content": reply}
-                )
-                _seed_doc_draft(
-                    doc.get("title") or "AI작성_공문",
-                    doc.get("body") or "",
-                    reply=interpreted.get("reply", ""),
-                )
-                st.rerun()
-            else:
-                try:
-                    ctx = master_data.master_summary_text()
-                    aug = list(st.session_state["chat_messages"][:-1]) + [
-                        {
-                            "role": "user",
-                            "content": (
-                                f"[현재 마스터]\n{ctx}\n\n[사용자]\n{prompt}"
-                            ),
-                        }
-                    ]
-                    reply = chat_llm(aug, model=model)
-                except Exception as e:
-                    reply = interpreted.get("reply") or f"오류: {e}"
-                st.markdown(reply)
-                st.session_state["chat_messages"].append(
-                    {"role": "assistant", "content": reply}
-                )
+                reply = interpreted.get("reply") or f"오류: {e}"
+            st.session_state["chat_messages"].append(
+                {"role": "assistant", "content": reply}
+            )
+    st.rerun()
 
 
 def render_ai_help(*, compact: bool = False, key_prefix: str = "ai") -> None:
@@ -467,7 +522,7 @@ def sidebar() -> str:
     return model
 
 
-def render_mapping_ui(df_columns: list[str]) -> None:
+def render_mapping_ui(df_columns: list[str], *, key_prefix: str = "map") -> None:
     st.subheader("컬럼 매핑")
     st.write("장부 열 이름을 앱이 이해하는 역할에 연결합니다.")
     mapping = load_mapping()
@@ -476,9 +531,9 @@ def render_mapping_ui(df_columns: list[str]) -> None:
     for role, label in ROLE_LABELS.items():
         current = mapping.get(role)
         idx = cols.index(current) if current in cols else 0
-        choice = st.selectbox(label, cols, index=idx, key=f"map_{role}")
+        choice = st.selectbox(label, cols, index=idx, key=f"{key_prefix}_{role}")
         new_map[role] = None if choice == "(선택 안 함)" else choice
-    if st.button("매핑 저장", type="primary"):
+    if st.button("매핑 저장", type="primary", key=f"{key_prefix}_save"):
         save_mapping(new_map)
         st.success("매핑을 저장했습니다.")
         st.session_state["goto_mapping"] = False
@@ -611,7 +666,7 @@ def tab_excel() -> None:
         st.caption(f"행 {len(df)} / 열 {len(df.columns)}")
 
         st.markdown("---")
-        render_mapping_ui([str(c) for c in df.columns])
+        render_mapping_ui([str(c) for c in df.columns], key_prefix="excel_map")
     except Exception as e:
         st.error(str(e))
 
@@ -625,9 +680,10 @@ def _tab_excel_dispatch() -> None:
 
     st.write(
         "양식: 순서·차번·차종·성명·1~31·근무일수. "
-        "Teams 수익 엑셀로 **차량별 당월수익·초과지급**을 보고, "
+        "TIMS 수익 엑셀로 **차량별 당월수익·초과지급**을 보고, "
         "엑셀에 나온 날 기준 **운행 없음/수익 0 → 휴차**, 수익 있으면 근무. "
-        "**담당 기사가 없는 차량은 일자를 기입하지 않습니다.** "
+        "가져올 때 **기사 배정차량·변동사항 `[배정]`** 도 함께 최신화합니다. "
+        "**배정 기사가 없는 차량은 일자를 기입하지 않습니다.** "
         "시급·초과기준·공제비율은 아래에서 변경할 수 있습니다."
     )
 
@@ -707,12 +763,39 @@ def _tab_excel_dispatch() -> None:
     st.session_state["dispatch_edit_path"] = str(path)
     st.info(f"편집 중: `{path.name}`")
 
+    assign_lines = dispatch_log.list_assignment_changes(sel_y, sel_m)
+    with st.expander("이달 배정 변동 (기사 변동사항 `[배정]`)", expanded=bool(assign_lines)):
+        st.caption(
+            "기사 **변동사항** 형식: `[배정] YYYY-MM-DD 이전차→이후차` "
+            "(예: `[배정] 2025-09-10 12가3456→78가9012`). "
+            "대차 시 기사 **배정차량**을 새 차로 바꾸고 변동사항에 한 줄을 남기면, "
+            "TIMS 가져오기 또는 아래 버튼으로 배차일지에 반영됩니다. "
+            "차량 메모는 고장 등 **상태**만 적습니다."
+        )
+        if assign_lines:
+            for line in assign_lines:
+                st.write(f"- {line}")
+        else:
+            st.caption("이달에 해당하는 `[배정]` 변동이 없습니다.")
+        if st.button("기사 배정·변동사항 반영", key="dispatch_apply_assign"):
+            try:
+                msgs = dispatch_log.apply_assignments_to_month(sel_y, sel_m)
+                st.session_state["dispatch_dirty"] = False
+                if any("열려 있어" in m for m in msgs):
+                    st.error("\n".join(m for m in msgs if "열려 있어" in m))
+                else:
+                    st.success("기사 배정·변동사항을 반영했습니다.")
+                    st.text("\n".join(msgs[:40]))
+                    st.rerun()
+            except Exception as e:
+                st.error(f"배정 반영 실패: {e}")
+
     # —— 시급·초과금 설정 ——
     with st.expander("시급·초과금 설정 (전원 동일)", expanded=False):
         ws = wage_settings.load_settings()
         st.caption(
             "초과금 = (월수입 − 기준액) × 기사지급비율. "
-            "비율·기준·시급은 언제든 바꿀 수 있고, Teams 수익 반영 시 해당 달에 스냅샷이 남습니다."
+            "비율·기준·시급은 언제든 바꿀 수 있고, TIMS 수익 반영 시 해당 달에 스냅샷이 남습니다."
         )
         c_w1, c_w2, c_w3 = st.columns(3)
         with c_w1:
@@ -767,8 +850,12 @@ def _tab_excel_dispatch() -> None:
 
     st.caption(wage_settings.rates_caption(sel_y, sel_m))
 
-    # —— Teams 수익 엑셀 ——
-    with st.expander("Teams 수익 엑셀 가져오기 (차량별 수익·휴차 반영)", expanded=False):
+    # —— TIMS 수익 엑셀 ——
+    with st.expander(
+        "TIMS 수익 엑셀 가져오기 (배정·변동·수익·휴차 반영)",
+        expanded=False,
+    ):
+        st.caption("반영 시: ① 기사 배정차량 맞춤 ② 변동사항 `[배정]` ③ 수익·휴차")
         up = st.file_uploader("수익 엑셀 (.xlsx)", type=["xlsx"], key="revenue_xlsx")
         if up is not None:
             try:
@@ -822,9 +909,13 @@ def _tab_excel_dispatch() -> None:
                                 )
                             )
                         st.session_state["dispatch_dirty"] = False
-                        st.success("반영 완료")
+                        if any("열려 있어" in m for m in msgs):
+                            st.error("\n".join(m for m in msgs if "열려 있어" in m))
+                        else:
+                            st.success("반영 완료")
                         st.text("\n".join(msgs[:40]))
-                        st.rerun()
+                        if not any("열려 있어" in m for m in msgs):
+                            st.rerun()
             except Exception as e:
                 st.error(f"수익 엑셀 처리 실패: {e}")
 
@@ -842,11 +933,6 @@ def _tab_excel_dispatch() -> None:
                 for d in drivers
                 if str(d.get("name") or "").strip()
             }
-            | {
-                str(v.get("driver_name")).strip()
-                for v in vehicles
-                if str(v.get("driver_name") or "").strip()
-            }
         )
         # 표에 이미 있는 값도 선택지에 포함
         for col, opts in (("차번", plate_options), ("성명", name_options)):
@@ -861,14 +947,19 @@ def _tab_excel_dispatch() -> None:
             if str(v.get("plate") or "").strip()
         }
         driver_by_plate = {
-            str(v.get("plate")).strip(): str(v.get("driver_name") or "")
-            for v in vehicles
-            if str(v.get("plate") or "").strip()
+            str(d.get("assigned_plate")).strip(): str(d.get("name") or "").strip()
+            for d in drivers
+            if str(d.get("assigned_plate") or "").strip()
+                and str(d.get("name") or "").strip()
         }
+        # 정규화 키도 넣어 enrichment가 공백 차이에도 동작
+        for k, name in list(master_data.plate_to_driver_name().items()):
+            if k and name and k not in driver_by_plate:
+                driver_by_plate[k] = name
 
         st.caption(
             "차번·성명은 **AI 채팅에 등록된 차량·기사** 목록에서 선택하세요. "
-            "**당월수익·초과지급**은 Teams 엑셀 반영값(읽기 전용)입니다."
+            "**당월수익·초과지급**은 TIMS 엑셀 반영값(읽기 전용)입니다."
         )
 
         with st.expander("등록 차량으로 행 추가", expanded=False):
@@ -885,7 +976,6 @@ def _tab_excel_dispatch() -> None:
                     target = add_plate.replace(" ", "").upper()
                     exists = any(
                         str(r.get("차번", "")).replace(" ", "").upper() == target
-                        or str(r.get("차번", "")).replace(" ", "").upper().endswith(target)
                         for _, r in cur.iterrows()
                     )
                     if exists:
@@ -952,7 +1042,7 @@ def _tab_excel_dispatch() -> None:
                     "당월수익",
                     disabled=True,
                     format="%.0f",
-                    help="Teams 엑셀 차량별 합계",
+                    help="TIMS 엑셀 차량별 합계",
                 ),
                 "초과지급": st.column_config.NumberColumn(
                     "초과지급",
@@ -978,14 +1068,16 @@ def _tab_excel_dispatch() -> None:
                 if v > float(rates.get("excess_threshold") or 0)
             )
             st.caption(
-                f"Teams 반영 차량 {len(plate_rev)}대 · "
+                f"TIMS 반영 차량 {len(plate_rev)}대 · "
                 f"월합 {sum(plate_rev.values()):,.0f}원 · "
                 f"초과 해당 {over_n}대"
             )
         else:
-            st.caption("아직 이달 Teams 수익이 없습니다. 위에서 엑셀을 가져오세요.")
+            st.caption("아직 이달 TIMS 수익이 없습니다. 위에서 엑셀을 가져오세요.")
 
         def _enrich_from_master(frame: pd.DataFrame) -> pd.DataFrame:
+            from modules.plate_utils import norm_plate as _np
+
             out = frame.copy()
             for i, row in out.iterrows():
                 plate = str(row.get("차번") or "").strip()
@@ -993,8 +1085,10 @@ def _tab_excel_dispatch() -> None:
                     continue
                 if not str(row.get("차종") or "").strip() and plate in vtype_by_plate:
                     out.at[i, "차종"] = vtype_by_plate[plate]
-                if not str(row.get("성명") or "").strip() and plate in driver_by_plate:
-                    out.at[i, "성명"] = driver_by_plate[plate]
+                if not str(row.get("성명") or "").strip():
+                    name = driver_by_plate.get(plate) or driver_by_plate.get(_np(plate), "")
+                    if name:
+                        out.at[i, "성명"] = name
             return out
 
         def _strip_display_cols(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1008,54 +1102,43 @@ def _tab_excel_dispatch() -> None:
                     to_save = _enrich_from_master(_strip_display_cols(edited))
                     saved = dispatch_log.save_path(to_save, path, backup=True)
                     st.session_state["dispatch_dirty"] = False
+                    st.session_state.pop("dispatch_locked_path", None)
                     st.success(f"저장됨: {saved.name}")
                     st.rerun()
+                except dispatch_log.FileLockedError as e:
+                    st.session_state["dispatch_locked_path"] = str(path)
+                    st.session_state["dispatch_locked_df"] = _strip_display_cols(edited)
+                    st.error(str(e))
                 except Exception as e:
                     st.error(f"저장 실패: {e}")
+            if st.session_state.get("dispatch_locked_path") == str(path):
+                if st.button("다시 저장", type="primary", key="dispatch_retry_save"):
+                    try:
+                        pending = st.session_state.get("dispatch_locked_df")
+                        if pending is None:
+                            pending = _strip_display_cols(edited)
+                        to_save = _enrich_from_master(pending)
+                        saved = dispatch_log.save_path(to_save, path, backup=True)
+                        st.session_state["dispatch_dirty"] = False
+                        st.session_state.pop("dispatch_locked_path", None)
+                        st.session_state.pop("dispatch_locked_df", None)
+                        st.success(f"저장됨: {saved.name}")
+                        st.rerun()
+                    except dispatch_log.FileLockedError as e:
+                        st.error(str(e))
+                    except Exception as e:
+                        st.error(f"저장 실패: {e}")
         with b2:
-            if st.button("등록 차량 기준으로 행 맞추기", key="dispatch_resync"):
+            if st.button("기사 배정·변동사항으로 맞추기", key="dispatch_resync"):
                 try:
-                    cur = _strip_display_cols(edited).copy()
-                    for v in vehicles:
-                        plate = str(v.get("plate") or "")
-                        if not plate:
-                            continue
-                        idx = None
-                        target = plate.replace(" ", "").upper()
-                        for i, row in cur.iterrows():
-                            p = str(row.get("차번", "")).replace(" ", "").upper()
-                            if p == target or p.endswith(target) or target.endswith(p):
-                                idx = i
-                                break
-                        if idx is None:
-                            order = int(cur["순서"].max()) + 1 if len(cur) else 1
-                            from modules.dispatch_log import _empty_row
-
-                            cur = pd.concat(
-                                [
-                                    cur,
-                                    pd.DataFrame(
-                                        [
-                                            _empty_row(
-                                                order,
-                                                plate=plate,
-                                                vtype=str(v.get("vehicle_type") or ""),
-                                                name=str(v.get("driver_name") or ""),
-                                            )
-                                        ]
-                                    ),
-                                ],
-                                ignore_index=True,
-                            )
-                        else:
-                            if v.get("vehicle_type"):
-                                cur.at[idx, "차종"] = v.get("vehicle_type")
-                            if v.get("driver_name"):
-                                cur.at[idx, "성명"] = v.get("driver_name")
-                    dispatch_log.save_path(cur, path, backup=True)
+                    msgs = dispatch_log.apply_assignments_to_month(sel_y, sel_m)
                     st.session_state["dispatch_dirty"] = False
-                    st.success("등록 차량·담당기사 기준으로 맞추고 저장했습니다.")
-                    st.rerun()
+                    if any("열려 있어" in m for m in msgs):
+                        st.error("\n".join(m for m in msgs if "열려 있어" in m))
+                    else:
+                        st.success("기사 배정차량·변동사항 기준으로 맞추고 저장했습니다.")
+                        st.text("\n".join(msgs[:40]))
+                        st.rerun()
                 except Exception as e:
                     st.error(str(e))
         with b3:
@@ -1077,7 +1160,7 @@ def _tab_excel_dispatch() -> None:
             step=1000.0,
             format="%.0f",
             key=f"dispatch_rev_total_{sel_y}_{sel_m}",
-            help="Teams 수익 반영 시 자동 저장됩니다. 필요하면 수동으로 수정하세요.",
+            help="TIMS 수익 반영 시 자동 저장됩니다. 필요하면 수동으로 수정하세요.",
         )
         st.caption(preview["line1"])
         st.caption(
@@ -1218,20 +1301,25 @@ def tab_analysis() -> None:
         return
 
     miss = missing_roles(df.columns)
+    mapping_shown = False
     if miss:
         st.error(f"필수 열 체크리스트 — 부족: {', '.join(miss)}")
-        if st.button("컬럼 매핑으로 이동"):
+        if st.button("컬럼 매핑으로 이동", key="analysis_goto_mapping"):
             st.session_state["goto_mapping"] = True
-        render_mapping_ui([str(c) for c in df.columns])
+        render_mapping_ui([str(c) for c in df.columns], key_prefix="analysis_map")
+        mapping_shown = True
 
-    if st.button("분석 실행"):
+    if st.button("분석 실행", key="analysis_run"):
         try:
             result = analyzer.analyze_ledger(df)
             st.session_state["last_analysis"] = result
             if result.get("need_mapping"):
                 st.session_state["goto_mapping"] = True
                 st.error(result["summary_text"])
-                render_mapping_ui([str(c) for c in df.columns])
+                if not mapping_shown:
+                    render_mapping_ui(
+                        [str(c) for c in df.columns], key_prefix="analysis_map"
+                    )
             else:
                 st.text(result["summary_text"])
                 monthly = result["monthly"]
@@ -1242,7 +1330,7 @@ def tab_analysis() -> None:
             st.error(str(e))
 
     if st.session_state.get("last_analysis") and st.session_state["last_analysis"].get("ok"):
-        if st.button("리포트 저장"):
+        if st.button("리포트 저장", key="analysis_save_report"):
             try:
                 path = analyzer.save_report(st.session_state["last_analysis"])
                 st.success(f"저장됨: {path}")
@@ -1258,28 +1346,39 @@ def tab_analysis() -> None:
 
 def main() -> None:
     init_state()
+    try:
+        master_data.migrate_master_schema()
+    except Exception:
+        pass
     model = sidebar()
     st.title("택시 사업 자동화")
     st.caption("파일은 PC 문서 폴더에 저장 · AI는 Google Gemini (키 필요)")
 
-    tabs = st.tabs(
-        [
-            "AI 채팅",
-            "공문 모아보기",
-            "엑셀 장부 관리",
-            "AI 자동 수정·작성",
-            "데이터 분석 및 저장",
-        ]
+    # 라디오로 한 탭만 실행 (전체 탭 동시 렌더 방지)
+    tab_names = [
+        "AI 채팅",
+        "공문 모아보기",
+        "엑셀 장부 관리",
+        "AI 자동 수정·작성",
+        "데이터 분석 및 저장",
+    ]
+    tab = st.radio(
+        "메뉴",
+        tab_names,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="main_nav_tab",
     )
-    with tabs[0]:
+    st.markdown("---")
+    if tab == "AI 채팅":
         tab_chat(model)
-    with tabs[1]:
+    elif tab == "공문 모아보기":
         tab_documents(model)
-    with tabs[2]:
+    elif tab == "엑셀 장부 관리":
         tab_excel()
-    with tabs[3]:
+    elif tab == "AI 자동 수정·작성":
         tab_ai_edit(model)
-    with tabs[4]:
+    else:
         tab_analysis()
 
 

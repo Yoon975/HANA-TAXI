@@ -1,4 +1,4 @@
-"""
+﻿"""
 시급·초과금 설정 (전원 동일, 언제든 변경 가능).
 초과금: 월수입 X >= 기준액 → (X - 기준액) * 기사지급비율
 월별로 요율 스냅샷·차번별 수익을 남겨 과거 정산이 안 바뀌게 함.
@@ -158,15 +158,12 @@ def lookup_plate_revenue(plate: str, by_plate: dict[str, float]) -> float:
         return 0.0
     if target in by_plate:
         return float(by_plate[target])
-    for k, v in by_plate.items():
-        if target.endswith(k) or k.endswith(target) or target in k or k in target:
-            return float(v)
     return 0.0
 
 
 def save_revenues_from_agg(agg: pd.DataFrame, *, snapshot_wage: bool = True) -> dict[str, Any]:
     """
-    Teams 집계(business_date, plate, revenue) → 월·차번별 합 저장.
+    TIMS 집계(business_date, plate, revenue) → 월·차번별 합 저장.
     반환: { '2026-09': {'total': ..., 'plates': n}, ... }
     """
     if agg is None or agg.empty:

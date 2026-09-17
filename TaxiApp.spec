@@ -69,6 +69,7 @@ hiddenimports = [
     "modules.business_day",
     "modules.revenue_import",
     "modules.wage_settings",
+    "modules.plate_utils",
     "win32com",
     "win32com.client",
     "pythoncom",

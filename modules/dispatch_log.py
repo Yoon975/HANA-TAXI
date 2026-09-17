@@ -17,6 +17,18 @@ import pandas as pd
 from modules import master_data
 from modules.business_day import business_date, next_month
 from modules.paths import BACKUP_DIR, CONFIG_DIR, DISPATCH_ROOT, copy_with_stamp, ensure_storage
+from modules.plate_utils import norm_plate, plates_equal
+
+
+class FileLockedError(RuntimeError):
+    """엑셀 등에서 파일이 열려 저장할 수 없을 때."""
+
+
+def _locked_message(path: Path) -> str:
+    return (
+        f"`{path.name}` 파일이 다른 프로그램(엑셀 등)에서 열려 있어 저장할 수 없습니다. "
+        "파일을 닫은 뒤 「다시 저장」을 눌러 주세요."
+    )
 
 FIXED_COLS = ["순서", "차번", "차종", "성명"]
 DAY_COLS = [str(i) for i in range(1, 32)]
@@ -112,15 +124,31 @@ def create_month_from_master(year: int, month: int, *, overwrite: bool = False) 
         return path
 
     vehicles = master_data.load_vehicles()
-    rows = [
-        _empty_row(
-            i,
-            plate=str(v.get("plate") or ""),
-            vtype=str(v.get("vehicle_type") or v.get("type") or ""),
-            name=str(v.get("driver_name") or ""),
+    plate_driver = master_data.plate_to_driver_name()
+    rows = []
+    for i, v in enumerate(vehicles, start=1):
+        plate = str(v.get("plate") or "")
+        rows.append(
+            _empty_row(
+                i,
+                plate=plate,
+                vtype=str(v.get("vehicle_type") or v.get("type") or ""),
+                name=plate_driver.get(norm_plate(plate), ""),
+            )
         )
-        for i, v in enumerate(vehicles, start=1)
-    ]
+    # 차량 마스터에 없는 배정차량도 행 추가
+    known = {norm_plate(r["차번"]) for r in rows}
+    for d in master_data.load_drivers():
+        plate = str(d.get("assigned_plate") or "").strip()
+        name = str(d.get("name") or "").strip()
+        if not plate or not name:
+            continue
+        if norm_plate(plate) in known:
+            continue
+        rows.append(
+            _empty_row(len(rows) + 1, plate=plate, vtype="", name=name)
+        )
+        known.add(norm_plate(plate))
     if not rows:
         rows.append(_empty_row(1))
 
@@ -152,16 +180,29 @@ def _write_excel(df: pd.DataFrame, path: Path, year: int, month: int) -> None:
     title = f"배차일지 ({year}년 {month}월 1일 ~ {month}월 {last}일)"
     df = _normalize_df(df).reset_index(drop=True)
     df["순서"] = range(1, len(df) + 1)
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="배차일지", startrow=1)
-        writer.sheets["배차일지"].cell(1, 1, title)
+    try:
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="배차일지", startrow=1)
+            writer.sheets["배차일지"].cell(1, 1, title)
+    except PermissionError as e:
+        raise FileLockedError(_locked_message(path)) from e
+    except OSError as e:
+        # Windows에서 잠금이 OSError로 오기도 함
+        if getattr(e, "winerror", None) == 32 or "Permission" in str(e) or "denied" in str(e).lower():
+            raise FileLockedError(_locked_message(path)) from e
+        raise
 
 
 def save_month(df: pd.DataFrame, year: int, month: int, *, backup: bool = True) -> Path:
     path = month_path(year, month)
-    if backup and path.exists():
-        copy_with_stamp(path, BACKUP_DIR, prefix="dispatch_")
-    _write_excel(df, path, year, month)
+    try:
+        if backup and path.exists():
+            copy_with_stamp(path, BACKUP_DIR, prefix="dispatch_")
+        _write_excel(df, path, year, month)
+    except FileLockedError:
+        raise
+    except PermissionError as e:
+        raise FileLockedError(_locked_message(path)) from e
     return path
 
 
@@ -172,40 +213,290 @@ def save_path(df: pd.DataFrame, path: Path, *, backup: bool = True) -> Path:
     else:
         now = datetime.now()
         year, month = now.year, now.month
-    if backup and path.exists():
-        copy_with_stamp(path, BACKUP_DIR, prefix="dispatch_")
-    _write_excel(df, path, year, month)
+    try:
+        if backup and path.exists():
+            copy_with_stamp(path, BACKUP_DIR, prefix="dispatch_")
+        _write_excel(df, path, year, month)
+    except FileLockedError:
+        raise
+    except PermissionError as e:
+        raise FileLockedError(_locked_message(path)) from e
     return path
 
 
 def _find_row(df: pd.DataFrame, plate: str) -> int | None:
-    target = re.sub(r"\s+", "", str(plate or "")).upper()
+    target = norm_plate(plate)
     if not target:
         return None
     for i, row in df.iterrows():
-        p = re.sub(r"\s+", "", str(row.get("차번", ""))).upper()
-        if p == target or target in p or p.endswith(target) or target.endswith(p):
+        if plates_equal(row.get("차번", ""), target):
             return int(i)
     return None
 
 
 def _has_registered_driver(plate: str, row_name: str = "") -> bool:
-    """배차일지 성명 또는 마스터 담당기사가 있으면 True."""
+    """배차일지 성명 또는 기사 배정차량이 있으면 True."""
     name = str(row_name or "").strip()
     if name and name.lower() not in {"nan", "none"}:
         return True
-    target = re.sub(r"\s+", "", str(plate or "")).upper()
+    target = norm_plate(plate)
     if not target:
         return False
-    for v in master_data.load_vehicles():
-        vp = re.sub(r"\s+", "", str(v.get("plate") or "")).upper()
-        if not vp:
+    return bool(master_data.plate_to_driver_name().get(target))
+
+
+# [배정] YYYY-MM-DD 이전차→이후차  (연도 생략 시 호출 측 year 사용)
+_ASSIGN_RE = re.compile(
+    r"\[배정\]\s*"
+    r"(?:(\d{4})[-./])?(\d{1,2})[-./](\d{1,2})\s+"
+    r"([^\s→\-~]+)\s*(?:→|->|➜|⇒)\s*([^\s,，]+)",
+)
+
+
+def parse_assignment_memos(*, default_year: int | None = None) -> list[dict[str, Any]]:
+    """기사 변동사항(changes)·특이사항(note)에서 [배정] 줄을 파싱."""
+    from datetime import date as date_cls
+
+    items: list[dict[str, Any]] = []
+    for d in master_data.load_drivers():
+        name = str(d.get("name") or "").strip()
+        text = "\n".join(
+            [
+                str(d.get("changes") or ""),
+                str(d.get("note") or ""),
+            ]
+        )
+        if "[배정]" not in text:
             continue
-        if vp == target or target in vp or vp.endswith(target) or target.endswith(vp):
-            dn = str(v.get("driver_name") or "").strip()
-            if dn:
-                return True
-    return False
+        for m in _ASSIGN_RE.finditer(text):
+            y_s, mo_s, d_s, from_p, to_p = m.groups()
+            year = int(y_s) if y_s else (default_year or datetime.now().year)
+            try:
+                dt = date_cls(year, int(mo_s), int(d_s))
+            except ValueError:
+                continue
+            items.append(
+                {
+                    "date": dt,
+                    "from_plate": norm_plate(from_p),
+                    "to_plate": norm_plate(to_p),
+                    "from_raw": from_p.strip(),
+                    "to_raw": to_p.strip(),
+                    "source": "driver",
+                    "source_id": name,
+                    "driver_name": name,
+                    "raw": m.group(0).strip(),
+                }
+            )
+    items.sort(key=lambda x: (x["date"], x["from_plate"], x["to_plate"]))
+    return items
+
+
+def list_assignment_changes(year: int, month: int) -> list[str]:
+    """해당 월에 걸친 [배정] 요약 문자열."""
+    lines: list[str] = []
+    for item in parse_assignment_memos(default_year=year):
+        dt = item["date"]
+        if dt.year != year or dt.month != month:
+            continue
+        who = item.get("driver_name") or item.get("source_id") or ""
+        prefix = f"{who}: " if who else ""
+        lines.append(
+            f"{dt.month}/{dt.day} {prefix}{item['from_raw']} → {item['to_raw']}"
+        )
+    return lines
+
+
+def _master_driver_by_plate() -> dict[str, str]:
+    return master_data.plate_to_driver_name()
+
+
+def _master_type_by_plate() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for v in master_data.load_vehicles():
+        p = norm_plate(v.get("plate"))
+        if p:
+            out[p] = str(v.get("vehicle_type") or v.get("type") or "").strip()
+    return out
+
+
+def _ensure_plate_row(
+    df: pd.DataFrame, plate: str, *, vtype: str = "", name: str = ""
+) -> tuple[pd.DataFrame, int]:
+    idx = _find_row(df, plate)
+    if idx is not None:
+        return df, idx
+    order = int(df["순서"].max()) + 1 if len(df) else 1
+    df = pd.concat(
+        [df, pd.DataFrame([_empty_row(order, plate=plate, vtype=vtype, name=name)])],
+        ignore_index=True,
+    )
+    idx = _find_row(df, plate)
+    assert idx is not None
+    return df, idx
+
+
+def sync_driver_names_from_master(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """등록 차량 행 + 기사 배정차량 기준 성명 맞추기."""
+    out = df.copy()
+    msgs: list[str] = []
+    plate_driver = _master_driver_by_plate()
+    types = _master_type_by_plate()
+    vehicle_plates = set(types.keys())
+
+    # 등록 차량 행
+    for v in master_data.load_vehicles():
+        plate = str(v.get("plate") or "").strip()
+        if not plate:
+            continue
+        key = norm_plate(plate)
+        vtype = types.get(key, "")
+        name = plate_driver.get(key, "")
+        idx = _find_row(out, plate)
+        if idx is None:
+            order = int(out["순서"].max()) + 1 if len(out) else 1
+            out = pd.concat(
+                [
+                    out,
+                    pd.DataFrame(
+                        [_empty_row(order, plate=plate, vtype=vtype, name=name)]
+                    ),
+                ],
+                ignore_index=True,
+            )
+            msgs.append(f"행 추가(마스터): {plate}" + (f" / {name}" if name else ""))
+            continue
+        if vtype and str(out.at[idx, "차종"] or "") != vtype:
+            out.at[idx, "차종"] = vtype
+        prev = str(out.at[idx, "성명"] or "").strip()
+        if prev != name:
+            out.at[idx, "성명"] = name
+            msgs.append(f"성명 맞춤: {plate} → {name or '(비움)'}")
+
+    # 배정만 있고 차량 목록에 없는 차
+    for key, name in plate_driver.items():
+        if _find_row(out, key) is not None:
+            continue
+        # 표시용 원본 차번
+        raw_plate = key
+        for d in master_data.load_drivers():
+            if norm_plate(d.get("assigned_plate")) == key:
+                raw_plate = str(d.get("assigned_plate") or key)
+                break
+        order = int(out["순서"].max()) + 1 if len(out) else 1
+        out = pd.concat(
+            [
+                out,
+                pd.DataFrame(
+                    [_empty_row(order, plate=raw_plate, vtype=types.get(key, ""), name=name)]
+                ),
+            ],
+            ignore_index=True,
+        )
+        msgs.append(f"행 추가(배정): {raw_plate} / {name}")
+
+    # 등록 차량인데 배정 없으면 성명 비움
+    for i in list(out.index):
+        p = norm_plate(str(out.at[i, "차번"] or ""))
+        if p and p in vehicle_plates and p not in plate_driver:
+            if str(out.at[i, "성명"] or "").strip():
+                out.at[i, "성명"] = ""
+                msgs.append(f"성명 비움(배정 없음): {out.at[i, '차번']}")
+
+    return out, msgs
+
+
+def apply_assignment_memos_to_df(
+    df: pd.DataFrame, year: int, month: int
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    해당 월 기사 변동사항 [배정]을 날짜순 적용.
+    이후차에 기사명, 이전차 성명 제거. 일자(1/휴차)는 건드리지 않음.
+    """
+    out = df.copy()
+    msgs: list[str] = []
+    drivers_map = _master_driver_by_plate()
+    types = _master_type_by_plate()
+    memos = [
+        m
+        for m in parse_assignment_memos(default_year=year)
+        if m["date"].year == year and m["date"].month == month
+    ]
+    for item in memos:
+        from_p = item["from_plate"]
+        to_p = item["to_plate"]
+        if not from_p or not to_p:
+            continue
+        driver = (
+            str(item.get("driver_name") or "").strip()
+            or drivers_map.get(to_p)
+            or drivers_map.get(from_p)
+            or ""
+        )
+        if not driver:
+            fi = _find_row(out, from_p)
+            if fi is not None:
+                driver = str(out.at[fi, "성명"] or "").strip()
+        if not driver:
+            ti = _find_row(out, to_p)
+            if ti is not None:
+                driver = str(out.at[ti, "성명"] or "").strip()
+        if not driver:
+            msgs.append(
+                f"배정 건너뜀(기사 불명): {item['date']} {item['from_raw']}→{item['to_raw']}"
+            )
+            continue
+
+        out, to_idx = _ensure_plate_row(
+            out, item["to_raw"], vtype=types.get(to_p, ""), name=driver
+        )
+        out.at[to_idx, "성명"] = driver
+        if types.get(to_p):
+            out.at[to_idx, "차종"] = types[to_p]
+
+        from_idx = _find_row(out, from_p)
+        if from_idx is not None:
+            cur = str(out.at[from_idx, "성명"] or "").strip()
+            if not cur or cur == driver:
+                out.at[from_idx, "성명"] = ""
+
+        msgs.append(
+            f"배정 반영: {item['date'].month}/{item['date'].day} "
+            f"{item['from_raw']}→{item['to_raw']} ({driver})"
+        )
+    return out, msgs
+
+
+def sync_assignments(
+    df: pd.DataFrame, year: int, month: int
+) -> tuple[pd.DataFrame, list[str]]:
+    """기사 배정차량 맞춤 → [배정] 변동 → 배정차량 최종 맞춤."""
+    msgs: list[str] = []
+    out, m1 = sync_driver_names_from_master(df)
+    msgs.extend(m1)
+    out, m2 = apply_assignment_memos_to_df(out, year, month)
+    msgs.extend(m2)
+    out, m3 = sync_driver_names_from_master(out)
+    for line in m3:
+        if line not in msgs:
+            msgs.append(line)
+    return out, msgs
+
+
+def apply_assignments_to_month(year: int, month: int) -> list[str]:
+    """월 배차일지에 기사 배정·변동사항 반영 후 저장."""
+    path = ensure_month(year, month)
+    _, df = load_month(year, month)
+    df, msgs = sync_assignments(df, year, month)
+    try:
+        save_month(df, year, month, backup=True)
+    except FileLockedError as e:
+        return [str(e)]
+    if not msgs:
+        msgs.append(f"{year}-{month:02d}: 배정 변경 없음 → {path.name}")
+    else:
+        msgs.append(f"{year}-{month:02d}: 배정 저장 → {path.name}")
+    return msgs
 
 
 def describe_dispatch_ops(ops: list[dict[str, Any]], year: int, month: int) -> list[dict[str, str]]:
@@ -420,7 +711,8 @@ def apply_revenue_to_dispatch(
     """
     agg: business_date, plate, revenue
 
-    Teams 엑셀에 **나온 영업일** 기준으로:
+    TIMS 엑셀에 **나온 영업일** 기준으로:
+    - 먼저 기사 배정차량·변동사항 [배정]으로 성명 최신화
     - 해당 일·차량 수익 > 0 → '1'
     - 수익 0 이거나 **운행 행이 없음** → '휴차'
     - 기존 '퇴사'는 유지
@@ -446,12 +738,16 @@ def apply_revenue_to_dispatch(
         path = ensure_month(year, month)
         _, df = load_month(year, month)
 
+        # 1) 기사 배정·변동사항 최신화
+        df, assign_msgs = sync_assignments(df, year, month)
+        results.extend(assign_msgs)
+
         # 영업일·차번별 수익 맵 (정규화 차번)
         rev_map: dict[tuple[str, int], float] = {}
         days_present: set[int] = set()
         plates_in_agg: set[str] = set()
         for r in rows:
-            plate = re.sub(r"\s+", "", str(r["plate"] or "")).upper()
+            plate = norm_plate(r["plate"])
             day = int(r["business_date"].day)
             rev = float(r["revenue"])
             if not plate:
@@ -462,21 +758,14 @@ def apply_revenue_to_dispatch(
             rev_map[key] = rev_map.get(key, 0.0) + rev
 
         def _rev_for(plate: str, day: int) -> tuple[bool, float]:
-            """(엑셀에 해당 일 기록 여부, 수익합). 끝자리 매칭 포함."""
-            direct = rev_map.get((plate, day))
+            """정확 일치 차번의 해당 일 수익."""
+            p = norm_plate(plate)
+            direct = rev_map.get((p, day))
             if direct is not None:
                 return True, float(direct)
-            total = 0.0
-            found = False
-            for (p, d), v in rev_map.items():
-                if d != day:
-                    continue
-                if plate.endswith(p) or p.endswith(plate):
-                    total += float(v)
-                    found = True
-            return found, total
+            return False, 0.0
 
-        # 배차일지에 없는 Teams 차량 행 추가 (기사 있는 경우만)
+        # 배차일지에 없는 TIMS 차량 행 추가 (기사 있는 경우만)
         for plate in sorted(plates_in_agg):
             if _find_row(df, plate) is not None:
                 continue
@@ -484,12 +773,11 @@ def apply_revenue_to_dispatch(
                 results.append(f"행 추가 건너뜀(기사 미등록): {plate}")
                 continue
             order = int(df["순서"].max()) + 1 if len(df) else 1
-            vtype, name = "", ""
+            vtype = ""
+            name = master_data.plate_to_driver_name().get(plate, "")
             for v in master_data.load_vehicles():
-                vp = re.sub(r"\s+", "", str(v.get("plate") or "")).upper()
-                if vp == plate or plate in vp or vp.endswith(plate) or plate.endswith(vp):
+                if plates_equal(v.get("plate"), plate):
                     vtype = str(v.get("vehicle_type") or "")
-                    name = str(v.get("driver_name") or "")
                     break
             df = pd.concat(
                 [df, pd.DataFrame([_empty_row(order, plate=plate, vtype=vtype, name=name)])],
@@ -505,8 +793,7 @@ def apply_revenue_to_dispatch(
         skipped_no_driver = 0
 
         for i in list(df.index):
-            plate_raw = str(df.at[i, "차번"] or "")
-            plate = re.sub(r"\s+", "", plate_raw).upper()
+            plate = norm_plate(str(df.at[i, "차번"] or ""))
             if not plate:
                 continue
             row_name = str(df.at[i, "성명"] or "")
@@ -531,9 +818,13 @@ def apply_revenue_to_dispatch(
                 else:
                     work_count += 1
 
-        save_month(df, year, month, backup=True)
+        try:
+            save_month(df, year, month, backup=True)
+        except FileLockedError as e:
+            results.append(str(e))
+            return results
         results.append(
-            f"{year}-{month:02d}: Teams 영업일 {len(days)}일 · "
+            f"{year}-{month:02d}: TIMS 영업일 {len(days)}일 · "
             f"갱신 {filled}칸 (근무 {work_count} / 휴차·무운행 {off_count}) · "
             f"기사미등록 건너뜀 {skipped_no_driver}대 → {path.name}"
         )

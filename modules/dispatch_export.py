@@ -245,7 +245,12 @@ def export_submission_xlsx(
     ws.row_dimensions[stamp_row + 1].height = 28
     ws.row_dimensions[stamp_row + 2].height = 28
 
-    wb.save(path)
+    try:
+        wb.save(path)
+    except PermissionError as e:
+        from modules.dispatch_log import FileLockedError, _locked_message
+
+        raise FileLockedError(_locked_message(path)) from e
     return path, summary
 
 

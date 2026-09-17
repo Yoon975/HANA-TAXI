@@ -52,14 +52,16 @@ def load_vehicles() -> list[dict[str, Any]]:
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return list(data) if isinstance(data, list) else []
+        items = list(data) if isinstance(data, list) else []
     except (OSError, json.JSONDecodeError):
         return []
+    return [_normalize_vehicle(v) for v in items]
 
 
 def save_vehicles(items: list[dict[str, Any]]) -> Path:
     path = _vehicles_path()
-    path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    cleaned = [_normalize_vehicle(v) for v in items]
+    path.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 
@@ -69,39 +71,190 @@ def load_drivers() -> list[dict[str, Any]]:
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return list(data) if isinstance(data, list) else []
+        items = list(data) if isinstance(data, list) else []
     except (OSError, json.JSONDecodeError):
         return []
+    return [_normalize_driver(d) for d in items]
 
 
 def save_drivers(items: list[dict[str, Any]]) -> Path:
     path = _drivers_path()
-    path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    cleaned = [_normalize_driver(d) for d in items]
+    path.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 
+def _normalize_vehicle(v: dict[str, Any]) -> dict[str, Any]:
+    """차량: 차번·차종·상태메모. 담당기사 필드는 제거."""
+    out = {
+        "id": str(v.get("id") or _new_id()),
+        "plate": str(v.get("plate") or "").strip(),
+        "vehicle_type": str(v.get("vehicle_type") or v.get("type") or ""),
+        "note": str(v.get("note") or ""),
+        "updated_at": str(v.get("updated_at") or ""),
+    }
+    return out
+
+
+def _normalize_driver(d: dict[str, Any]) -> dict[str, Any]:
+    """기사: 배정차량·변동사항·특이사항."""
+    changes = str(d.get("changes") or "")
+    note = str(d.get("note") or "")
+    # 예전 note에 [배정]만 있던 경우 변동사항으로 분리
+    if not changes and "[배정]" in note:
+        change_lines = []
+        other_lines = []
+        for line in note.splitlines():
+            if "[배정]" in line:
+                change_lines.append(line.strip())
+            elif line.strip():
+                other_lines.append(line.strip())
+        changes = "\n".join(change_lines)
+        note = "\n".join(other_lines)
+    return {
+        "id": str(d.get("id") or _new_id()),
+        "name": str(d.get("name") or "").strip(),
+        "phone": str(d.get("phone") or ""),
+        "assigned_plate": str(
+            d.get("assigned_plate") or d.get("plate") or ""
+        ).strip(),
+        "changes": changes,
+        "note": note,
+        "updated_at": str(d.get("updated_at") or ""),
+    }
+
+
+def migrate_master_schema() -> list[str]:
+    """
+    차량.driver_name → 기사.assigned_plate 로 이전.
+    차량에서 담당기사 필드 제거. 앱 시작·로드 시 호출.
+    """
+    msgs: list[str] = []
+    raw_v_path = _vehicles_path()
+    raw_d_path = _drivers_path()
+    vehicles_raw: list[dict[str, Any]] = []
+    drivers_raw: list[dict[str, Any]] = []
+    if raw_v_path.exists():
+        try:
+            data = json.loads(raw_v_path.read_text(encoding="utf-8"))
+            vehicles_raw = list(data) if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError):
+            vehicles_raw = []
+    if raw_d_path.exists():
+        try:
+            data = json.loads(raw_d_path.read_text(encoding="utf-8"))
+            drivers_raw = list(data) if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError):
+            drivers_raw = []
+
+    drivers = [_normalize_driver(d) for d in drivers_raw]
+    changed = False
+
+    for v in vehicles_raw:
+        dname = str(v.get("driver_name") or "").strip()
+        plate = str(v.get("plate") or "").strip()
+        if not dname or not plate:
+            if "driver_name" in v:
+                changed = True
+            continue
+        idx = _find_driver(drivers, {"name": dname})
+        if idx is None:
+            drivers.append(
+                _normalize_driver(
+                    {
+                        "id": _new_id(),
+                        "name": dname,
+                        "assigned_plate": plate,
+                        "phone": "",
+                        "changes": "",
+                        "note": "",
+                        "updated_at": _now(),
+                    }
+                )
+            )
+            msgs.append(f"마이그레이션: 기사 추가 {dname} ← {plate}")
+            changed = True
+        else:
+            cur = str(drivers[idx].get("assigned_plate") or "").strip()
+            if not cur:
+                drivers[idx]["assigned_plate"] = plate
+                drivers[idx]["updated_at"] = _now()
+                msgs.append(f"마이그레이션: {dname} 배정차량={plate}")
+                changed = True
+            elif _norm_plate(cur) != _norm_plate(plate):
+                # 이미 다른 차가 있으면 차량 쪽 담당은 버리고 기사 배정 유지
+                msgs.append(
+                    f"마이그레이션 건너뜀: {dname} 이미 {cur} 배정 (차량 {plate} 무시)"
+                )
+        if "driver_name" in v:
+            changed = True
+
+    vehicles = [_normalize_vehicle(v) for v in vehicles_raw]
+    # 1차 1기사: 같은 배정차량이 여러 기사면 마지막만 유지
+    seen_plates: dict[str, int] = {}
+    for i, d in enumerate(drivers):
+        p = _norm_plate(d.get("assigned_plate") or "")
+        if not p:
+            continue
+        if p in seen_plates:
+            drivers[seen_plates[p]]["assigned_plate"] = ""
+            changed = True
+        seen_plates[p] = i
+
+    if changed or any("driver_name" in v for v in vehicles_raw):
+        save_vehicles(vehicles)
+        save_drivers(drivers)
+        if not msgs:
+            msgs.append("마스터 스키마 정리 완료 (차량 담당기사 → 기사 배정차량)")
+    return msgs
+
+
+def plate_to_driver_name() -> dict[str, str]:
+    """정규화 차번 → 기사 이름 (현재 배정)."""
+    out: dict[str, str] = {}
+    for d in load_drivers():
+        p = _norm_plate(d.get("assigned_plate") or "")
+        name = str(d.get("name") or "").strip()
+        if p and name:
+            out[p] = name
+    return out
+
+
+def driver_name_to_plate() -> dict[str, str]:
+    """정규화 이름 → 배정 차번."""
+    out: dict[str, str] = {}
+    for d in load_drivers():
+        name = _norm_name(d.get("name") or "")
+        plate = str(d.get("assigned_plate") or "").strip()
+        if name and plate:
+            out[name] = plate
+    return out
+
+
 def master_summary_text() -> str:
+    migrate_master_schema()
     vehicles = load_vehicles()
     drivers = load_drivers()
     v_lines = [
         f"- {v.get('plate','')} (id={v.get('id','')}"
         + (f", 차종={v.get('vehicle_type')}" if v.get("vehicle_type") else "")
-        + (f", 담당기사={v.get('driver_name')}" if v.get("driver_name") else "")
-        + (f", 메모={v.get('note')}" if v.get("note") else "")
+        + (f", 상태={v.get('note')}" if v.get("note") else "")
         + ")"
         for v in vehicles
     ] or ["- (없음)"]
     d_lines = [
         f"- {d.get('name','')} (id={d.get('id','')}"
         + (f", 전화={d.get('phone')}" if d.get("phone") else "")
-        + (f", 메모={d.get('note')}" if d.get("note") else "")
+        + (f", 배정차량={d.get('assigned_plate')}" if d.get("assigned_plate") else "")
+        + (f", 변동={d.get('changes')}" if d.get("changes") else "")
+        + (f", 특이={d.get('note')}" if d.get("note") else "")
         + ")"
         for d in drivers
     ] or ["- (없음)"]
     return (
-        "등록 차량:\n"
+        "등록 차량 (상태메모만, 담당기사는 기사쪽에):\n"
         + "\n".join(v_lines)
-        + "\n등록 기사:\n"
+        + "\n등록 기사 (배정차량·변동사항·특이사항):\n"
         + "\n".join(d_lines)
     )
 
@@ -143,7 +296,11 @@ def interpret_user_message(user_command: str, model: str = DEFAULT_MODEL) -> dic
 사용자 말: {user_command}
 
 판단 규칙 (우선순위):
-1) 차량/기사 마스터 등록·추가·수정·삭제·이름·번호·차종 변경 → mode="master_ops"
+1) 차량/기사 마스터 등록·추가·수정·삭제·이름·번호·차종·배정·상태 변경 → mode="master_ops"
+   - 차량: 차번·차종·상태메모(고장 등). 담당기사는 차량에 두지 않음.
+   - 기사: 이름·전화·배정차량(assigned_plate)·변동사항(changes)·특이사항(note)
+   - 대차/배정 변경: 기사 entity update 로 assigned_plate 변경, changes에
+     "[배정] YYYY-MM-DD 이전차→이후차" 한 줄 추가
 2) 공문·안내문·공고 초안/작성 → mode="doc_draft" (title, body)
 3) 배차일지 작성·기입·근무표시·성명 지정·월 일지 만들기 → mode="dispatch_ops"
    - year, month 필수 (언급 없으면 오늘 연월)
@@ -166,7 +323,7 @@ JSON 스키마:
       "entity": "vehicle" | "driver",
       "action": "add" | "update" | "delete",
       "match": {{"id": "", "plate": "", "name": ""}},
-      "set": {{"plate": "", "name": "", "phone": "", "note": "", "vehicle_type": "", "driver_name": ""}}
+      "set": {{"plate": "", "name": "", "phone": "", "note": "", "vehicle_type": "", "assigned_plate": "", "changes": ""}}
     }}
   ],
   "doc": {{"title": "", "body": ""}},
@@ -297,15 +454,47 @@ def _find_driver(items: list[dict[str, Any]], match: dict[str, Any]) -> int | No
 
 def apply_ops(ops: list[dict[str, Any]]) -> list[str]:
     """ops 적용 후 결과 메시지 목록."""
+    migrate_master_schema()
     vehicles = load_vehicles()
     drivers = load_drivers()
     results: list[str] = []
+
+    def _clear_plate_from_other_drivers(plate: str, keep_idx: int | None) -> None:
+        target = _norm_plate(plate)
+        if not target:
+            return
+        for i, d in enumerate(drivers):
+            if keep_idx is not None and i == keep_idx:
+                continue
+            if _norm_plate(str(d.get("assigned_plate") or "")) == target:
+                drivers[i]["assigned_plate"] = ""
 
     for op in ops:
         entity = (op.get("entity") or "").lower()
         action = (op.get("action") or "").lower()
         match = op.get("match") or {}
         aset = {k: v for k, v in (op.get("set") or {}).items() if v not in (None, "")}
+
+        # 예전: 차량에 담당기사 지정 → 기사 배정차량으로 변환
+        if entity == "vehicle" and "driver_name" in aset:
+            dname = str(aset.get("driver_name") or "").strip()
+            plate = str(aset.get("plate") or match.get("plate") or "").strip()
+            if not plate:
+                idx_v = _find_vehicle(vehicles, match)
+                if idx_v is not None:
+                    plate = str(vehicles[idx_v].get("plate") or "")
+            if dname and plate:
+                entity = "driver"
+                action = (
+                    "update"
+                    if _find_driver(drivers, {"name": dname}) is not None
+                    else "add"
+                )
+                match = {"name": dname}
+                aset = {"name": dname, "assigned_plate": plate}
+                results.append(f"(변환) 차량 담당기사 → 기사 배정: {dname}={plate}")
+            else:
+                aset.pop("driver_name", None)
 
         if entity == "vehicle":
             if action == "add":
@@ -317,21 +506,16 @@ def apply_ops(ops: list[dict[str, Any]]) -> list[str]:
                     results.append(f"차량 추가 건너뜀(이미 있음): {plate}")
                     continue
                 vehicles.append(
-                    {
-                        "id": _new_id(),
-                        "plate": str(plate).strip(),
-                        "vehicle_type": str(aset.get("vehicle_type") or ""),
-                        "driver_name": str(aset.get("driver_name") or aset.get("name") or ""),
-                        "note": str(aset.get("note") or ""),
-                        "updated_at": _now(),
-                    }
+                    _normalize_vehicle(
+                        {
+                            "id": _new_id(),
+                            "plate": str(plate).strip(),
+                            "vehicle_type": str(aset.get("vehicle_type") or ""),
+                            "note": str(aset.get("note") or ""),
+                            "updated_at": _now(),
+                        }
+                    )
                 )
-                # 1차량 1기사: 같은 기사가 다른 차에 있으면 해제
-                dname = vehicles[-1]["driver_name"]
-                if dname:
-                    for i, v in enumerate(vehicles[:-1]):
-                        if _norm_name(str(v.get("driver_name") or "")) == _norm_name(dname):
-                            vehicles[i]["driver_name"] = ""
                 results.append(f"차량 추가: {plate}")
             elif action == "update":
                 idx = _find_vehicle(vehicles, match) or _find_vehicle(
@@ -344,15 +528,6 @@ def apply_ops(ops: list[dict[str, Any]]) -> list[str]:
                     vehicles[idx]["plate"] = str(aset["plate"]).strip()
                 if "vehicle_type" in aset:
                     vehicles[idx]["vehicle_type"] = str(aset["vehicle_type"])
-                if "driver_name" in aset or "name" in aset:
-                    dname = str(aset.get("driver_name") or aset.get("name") or "")
-                    vehicles[idx]["driver_name"] = dname
-                    if dname:
-                        for i, v in enumerate(vehicles):
-                            if i == idx:
-                                continue
-                            if _norm_name(str(v.get("driver_name") or "")) == _norm_name(dname):
-                                vehicles[i]["driver_name"] = ""
                 if "note" in aset:
                     vehicles[idx]["note"] = str(aset["note"])
                 vehicles[idx]["updated_at"] = _now()
@@ -376,16 +551,23 @@ def apply_ops(ops: list[dict[str, Any]]) -> list[str]:
                 if _find_driver(drivers, {"name": name}) is not None:
                     results.append(f"기사 추가 건너뜀(이미 있음): {name}")
                     continue
+                plate = str(aset.get("assigned_plate") or aset.get("plate") or "").strip()
                 drivers.append(
-                    {
-                        "id": _new_id(),
-                        "name": str(name).strip(),
-                        "phone": str(aset.get("phone") or ""),
-                        "note": str(aset.get("note") or ""),
-                        "updated_at": _now(),
-                    }
+                    _normalize_driver(
+                        {
+                            "id": _new_id(),
+                            "name": str(name).strip(),
+                            "phone": str(aset.get("phone") or ""),
+                            "assigned_plate": plate,
+                            "changes": str(aset.get("changes") or ""),
+                            "note": str(aset.get("note") or ""),
+                            "updated_at": _now(),
+                        }
+                    )
                 )
-                results.append(f"기사 추가: {name}")
+                if plate:
+                    _clear_plate_from_other_drivers(plate, len(drivers) - 1)
+                results.append(f"기사 추가: {name}" + (f" / 배정 {plate}" if plate else ""))
             elif action == "update":
                 idx = _find_driver(drivers, match) or _find_driver(
                     drivers, {"name": aset.get("name")}
@@ -397,10 +579,36 @@ def apply_ops(ops: list[dict[str, Any]]) -> list[str]:
                     drivers[idx]["name"] = str(aset["name"]).strip()
                 if "phone" in aset:
                     drivers[idx]["phone"] = str(aset["phone"])
+                if "assigned_plate" in aset or "plate" in aset:
+                    plate = str(aset.get("assigned_plate") or aset.get("plate") or "").strip()
+                    old_plate = str(drivers[idx].get("assigned_plate") or "").strip()
+                    drivers[idx]["assigned_plate"] = plate
+                    if plate:
+                        _clear_plate_from_other_drivers(plate, idx)
+                    # 배정 변경 시 변동사항에 [배정] 자동 추가 (changes에 직접 안 넣은 경우)
+                    if (
+                        old_plate
+                        and plate
+                        and _norm_plate(old_plate) != _norm_plate(plate)
+                        and "changes" not in aset
+                    ):
+                        today = datetime.now().strftime("%Y-%m-%d")
+                        line = f"[배정] {today} {old_plate}→{plate}"
+                        prev = str(drivers[idx].get("changes") or "").strip()
+                        drivers[idx]["changes"] = (prev + "\n" + line).strip() if prev else line
+                if "changes" in aset:
+                    drivers[idx]["changes"] = str(aset["changes"])
                 if "note" in aset:
                     drivers[idx]["note"] = str(aset["note"])
                 drivers[idx]["updated_at"] = _now()
-                results.append(f"기사 수정: {drivers[idx].get('name')}")
+                results.append(
+                    f"기사 수정: {drivers[idx].get('name')}"
+                    + (
+                        f" / 배정 {drivers[idx].get('assigned_plate')}"
+                        if drivers[idx].get("assigned_plate")
+                        else ""
+                    )
+                )
             elif action == "delete":
                 idx = _find_driver(drivers, match)
                 if idx is None:
